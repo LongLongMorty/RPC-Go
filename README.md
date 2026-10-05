@@ -1,4 +1,4 @@
-# kamaRPC
+# RPC-GO
 
 一个使用 Go 从零实现的 RPC 框架，用于学习 RPC 的核心原理与工程实践。
 
@@ -37,7 +37,34 @@ Accept ──► 每连接一个 goroutine ──► 拆包(io.ReadFull)
    ▼
 限流 ──► 反射调用业务方法 ──► 序列化 + gzip ──► 回写
 ```
+## 具体过程
+```
+【发送端 Encode 封包流程】
+ 内存中的结构体 (Struct) 
+       │
+       ▼  1. 序列化 (JSON / Protobuf)
+ 原始字节流 ([]byte)
+       │
+       ▼  2. 数据压缩 (Gzip / Snappy / Zstd)
+ 压缩后的字节流 ([]byte)
+       │
+       ▼  3. 网络封包 (拼接 Magic + Length + Header + Body)
+ 二进制网络数据帧 ──────( TCP 传输 )──────>
 
+────────────────────────────────────────────────────────
+
+【接收端 Decode 解包流程】
+ 二进制网络数据帧
+       │
+       ▼  1. 拆包提取 (根据 Length 切割 HeaderBytes 与 BodyBytes)
+ 压缩的字节流
+       │
+       ▼  2. 数据解压 (Decompress)
+ 原始字节流
+       │
+       ▼  3. 反序列化 (Unmarshal 为 Struct)
+ 内存中的结构体 (Struct)
+```
 ## 目录结构
 
 ```

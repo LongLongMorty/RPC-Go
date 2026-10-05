@@ -59,9 +59,6 @@ func (c *Client) InvokeAsync(ctx context.Context, service string, method string,
 
 	pool := c.getPool(addr)
 
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -80,7 +77,7 @@ func (c *Client) InvokeAsync(ctx context.Context, service string, method string,
 		},
 		Body: body,
 	}
-	future, err := conn.SendAsync(req)
+	future, err := conn.SendAsync(req, c.timeout)
 	if err != nil {
 		br.RecordFailure()
 		return nil, err

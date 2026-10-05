@@ -14,7 +14,8 @@ type Future struct {
 	mu    sync.Mutex
 	codec codec.Codec
 
-	onComplete func(error)
+	onComplete []func(error)
+	completed  bool
 }
 
 func NewFuture() *Future {
@@ -25,14 +26,22 @@ func NewFuture() *Future {
 	}
 }
 
+// Done 只会生效一次，重复调用是安全的（避免 close 已关闭的 channel 而 panic）
 func (f *Future) Done(res []byte, err error) {
 	f.mu.Lock()
+	if f.completed {
+		f.mu.Unlock()
+		return
+	}
+	f.completed = true
 	f.res = res
 	f.err = err
+	callbacks := f.onComplete
+	f.onComplete = nil
 	f.mu.Unlock()
 
-	if f.onComplete != nil {
-		f.onComplete(err)
+	for _, cb := range callbacks {
+		cb(err)
 	}
 
 	close(f.done)
@@ -45,8 +54,21 @@ func (f *Future) Wait() ([]byte, error) {
 	return f.res, f.err
 }
 
+// OnComplete 注册完成回调，可注册多个；若已完成则立即回调。
 func (f *Future) OnComplete(fn func(error)) {
-	f.onComplete = fn
+	if fn == nil {
+		return
+	}
+
+	f.mu.Lock()
+	if f.completed {
+		err := f.err
+		f.mu.Unlock()
+		fn(err)
+		return
+	}
+	f.onComplete = append(f.onComplete, fn)
+	f.mu.Unlock()
 }
 
 func (f *Future) WaitWithContext(ctx context.Context) ([]byte, error) {

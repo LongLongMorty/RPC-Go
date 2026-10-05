@@ -27,3 +27,16 @@ func WithServerCodec(t codec.Type) ServerOption {
 		return nil
 	}
 }
+
+// WithWorkerPool 配置业务处理的协程池大小与队列长度
+func WithWorkerPool(size, queue int) ServerOption {
+	return func(s *Server) error {
+		if size > 0 {
+			s.poolSize = size
+		}
+		if queue >= 0 {
+			s.poolQueue = queue
+		}
+		return nil
+	}
+}

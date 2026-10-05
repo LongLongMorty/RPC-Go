@@ -18,9 +18,14 @@ type Server struct {
 	handler  *Handler
 	codec    codec.Codec
 
-	connMu  sync.Mutex
-	conns   map[*transport.TCPConnection]struct{}
-	closing chan struct{}
+	pool      *workerPool
+	poolSize  int
+	poolQueue int
+
+	connMu    sync.Mutex
+	conns     map[*transport.TCPConnection]struct{}
+	closing   chan struct{}
+	handlerWG sync.WaitGroup
 }
 
 // 这边用了另外一种go规范去创建对象
@@ -34,12 +39,14 @@ func mustNewHandler() *Handler {
 
 func NewServer(addr string, opts ...ServerOption) (*Server, error) {
 	s := &Server{
-		addr:     addr,
-		services: make(map[string]interface{}),
-		limiter:  limiter.NewTokenBucket(10000),
-		handler:  mustNewHandler(),
-		conns:    make(map[*transport.TCPConnection]struct{}),
-		closing:  make(chan struct{}),
+		addr:      addr,
+		services:  make(map[string]interface{}),
+		limiter:   limiter.NewTokenBucket(10000),
+		handler:   mustNewHandler(),
+		conns:     make(map[*transport.TCPConnection]struct{}),
+		closing:   make(chan struct{}),
+		poolSize:  defaultPoolSize,
+		poolQueue: defaultPoolQueue,
 	}
 
 	for _, opt := range opts {
@@ -47,6 +54,8 @@ func NewServer(addr string, opts ...ServerOption) (*Server, error) {
 			return nil, err
 		}
 	}
+
+	s.pool = newWorkerPool(s.poolSize, s.poolQueue)
 	return s, nil
 }
 
@@ -54,12 +63,15 @@ func (s *Server) Register(name string, service interface{}) {
 	s.services[name] = service
 }
 
-// 单连接单协程串行模型,请求层面可以像http1.1一样复用一个连接
-// 但是现在是响应层面, 他只会顺序执行第一个请求,执行完之后才执行完第二个请求
-// todo:后续需要以流的形式去优化
+// 读与执行解耦：读循环只负责读取与限流，业务处理交给协程池异步执行，
+// 处理完后再并发写回（TCPConnection.Write 内部有写锁，保证写安全）。
+// 连接关闭前会等待本连接所有在途请求处理完毕。
 func (s *Server) Handle(conn *transport.TCPConnection) {
 	defer conn.Close()
-	log.Println("测试一次")
+
+	var inflight sync.WaitGroup
+	defer inflight.Wait()
+
 	for {
 		// 读取请求
 		msg, err := conn.Read()
@@ -70,18 +82,34 @@ func (s *Server) Handle(conn *transport.TCPConnection) {
 
 		// 限流检查
 		if !s.limiter.Allow() {
-			resp := &protocol.Message{
+			conn.Write(&protocol.Message{
 				Header: &protocol.Header{
 					RequestID:   msg.Header.RequestID,
 					Error:       "rate limit exceeded",
 					Compression: codec.CompressionGzip,
 				},
-			}
-			conn.Write(resp)
+			})
 			continue
 		}
-		// 处理请求
-		s.handler.Process(conn, msg, s.services[msg.Header.ServiceName])
+
+		service := s.services[msg.Header.ServiceName]
+
+		// 扔进协程池异步处理，读循环立即继续读下一个请求
+		inflight.Add(1)
+		if !s.pool.submit(func() {
+			defer inflight.Done()
+			s.handler.Process(conn, msg, service)
+		}) {
+			inflight.Done()
+			conn.Write(&protocol.Message{
+				Header: &protocol.Header{
+					RequestID:   msg.Header.RequestID,
+					Error:       "server shutting down",
+					Compression: codec.CompressionGzip,
+				},
+			})
+			return
+		}
 	}
 }
 
@@ -109,7 +137,9 @@ func (s *Server) Start() error {
 		s.conns[tcpConn] = struct{}{}
 		s.connMu.Unlock()
 
+		s.handlerWG.Add(1)
 		go func() {
+			defer s.handlerWG.Done()
 			s.Handle(tcpConn)
 			s.connMu.Lock()
 			delete(s.conns, tcpConn)
@@ -142,6 +172,10 @@ func (s *Server) Shutdown() {
 	for _, conn := range conns {
 		conn.Close()
 	}
+
+	// 等待所有连接的在途请求处理完，再优雅停止协程池
+	s.handlerWG.Wait()
+	s.pool.stop()
 
 	log.Println("server shutdown complete")
 }
